@@ -42,6 +42,7 @@ from kubeflow_mcp.common.constants import (
     ErrorCode,
     record_tool_result,
 )
+from kubeflow_mcp.common.types import ToolError, exception_details
 from kubeflow_mcp.core.resilience import get_breaker
 
 logger = logging.getLogger(__name__)
@@ -146,12 +147,18 @@ def describe_tools(tool_names: list[str]) -> dict[str, Any]:
         Tool schemas with parameter types and defaults.
     """
     if len(tool_names) > 5:
-        return {"error": "Max 5 tools at a time to conserve tokens"}
+        return ToolError(
+            error="Max 5 tools at a time to conserve tokens",
+            error_code=ErrorCode.VALIDATION_ERROR,
+            tool="describe_tools",
+        ).model_dump()
 
     results: list[dict[str, Any]] = []
     for name in tool_names:
         if name not in TOOL_REGISTRY:
-            results.append({"name": name, "error": "Tool not found"})
+            results.append(
+                {"name": name, "error": "Tool not found", "error_code": ErrorCode.TOOL_NOT_FOUND}
+            )
             continue
 
         tool = TOOL_REGISTRY[name]
@@ -190,7 +197,13 @@ def execute_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dic
         Tool execution result.
     """
     if tool_name not in TOOL_REGISTRY:
-        return {"error": f"Tool '{tool_name}' not found", "available": list(TOOL_REGISTRY.keys())}
+        return ToolError(
+            error=f"Tool '{tool_name}' not found",
+            error_code=ErrorCode.TOOL_NOT_FOUND,
+            details={"available": list(TOOL_REGISTRY.keys())},
+            hint="Call list_tools() or find_tools() to see the tools this server exposes.",
+            tool=tool_name,
+        ).model_dump()
 
     func = TOOL_REGISTRY[tool_name]["func"]
     args = arguments or {}
@@ -200,19 +213,21 @@ def execute_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dic
     try:
         inspect.signature(func).bind(**args)
     except TypeError as e:
-        return {
-            "error": f"Invalid arguments for '{tool_name}': {e}",
-            "error_code": ErrorCode.VALIDATION_ERROR,
-            "tool": tool_name,
-        }
+        return ToolError(
+            error=f"Invalid arguments for '{tool_name}': {e}",
+            error_code=ErrorCode.VALIDATION_ERROR,
+            hint="Call describe_tools() for the parameter schema, then retry with corrected arguments.",
+            tool=tool_name,
+        ).model_dump()
 
     breaker = get_breaker(tool_name)
     generation = breaker.acquire()
     if generation is None:
-        return {
-            "error": f"Circuit breaker open for '{tool_name}' — K8s API may be degraded. Retries automatically after recovery timeout.",
-            "error_code": ErrorCode.CIRCUIT_OPEN,
-        }
+        return ToolError(
+            error=f"Circuit breaker open for '{tool_name}' — K8s API may be degraded. Retries automatically after recovery timeout.",
+            error_code=ErrorCode.CIRCUIT_OPEN,
+            tool=tool_name,
+        ).model_dump()
 
     try:
         with warnings.catch_warnings():
@@ -220,7 +235,13 @@ def execute_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dic
             result = func(**args)
     except Exception as e:
         breaker.record_failure(generation)
-        return {"error": str(e), "error_code": ErrorCode.SDK_ERROR, "tool": tool_name}
+        logger.warning("execute_tool failed: %s", tool_name, exc_info=True)
+        return ToolError(
+            error=str(e),
+            error_code=ErrorCode.SDK_ERROR,
+            details=exception_details(e),
+            tool=tool_name,
+        ).model_dump()
 
     record_tool_result(breaker, result, generation)
     if isinstance(result, dict):
@@ -338,7 +359,11 @@ def find_tools(query: str, top_k: int = 5) -> dict[str, Any]:
         Matching tools ranked by relevance.
     """
     if len(query) > MAX_QUERY_LENGTH:
-        return {"error": f"Query too long ({len(query)} chars, max {MAX_QUERY_LENGTH})"}
+        return ToolError(
+            error=f"Query too long ({len(query)} chars, max {MAX_QUERY_LENGTH})",
+            error_code=ErrorCode.VALIDATION_ERROR,
+            tool="find_tools",
+        ).model_dump()
     top_k = max(1, min(top_k, MAX_TOP_K))
     query_lower = query.strip().lower()
     _list_all = {
